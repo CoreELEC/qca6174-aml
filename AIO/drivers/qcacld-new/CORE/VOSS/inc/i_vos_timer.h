@@ -46,7 +46,6 @@
 #include <linux/timer.h>
 #include <linux/time.h>
 #include <linux/jiffies.h>
-#include <adf_os_lock.h>
 
 /*--------------------------------------------------------------------------
   Preprocessor definitions and constants
@@ -64,7 +63,7 @@ typedef struct vos_timer_platform_s
    struct timer_list Timer;
    int threadID;
    v_U32_t cookie;
-   adf_os_spinlock_t  spinlock;
+   spinlock_t  spinlock;
 
 } vos_timer_platform_t;
 

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013-2014,2016-2019 The Linux Foundation. All rights reserved.
+ * Copyright (c) 2013-2014,2016 The Linux Foundation. All rights reserved.
  *
  * Previously licensed under the ISC license by Qualcomm Atheros, Inc.
  *
@@ -53,7 +53,6 @@
 #include "if_ath_sdio.h"
 
 #define NBUF_ALLOC_FAIL_WAIT_TIME 100
-#define MAX_CREDIT_SIZE 2048
 
 static void HIFDevDumpRegisters(HIF_SDIO_DEVICE *pDev,
         MBOX_IRQ_PROC_REGISTERS *pIrqProcRegs,
@@ -116,6 +115,7 @@ static void HIFDevDumpRegisters(HIF_SDIO_DEVICE *pDev,
    AR_DEBUG_PRINTF(ATH_DEBUG_ANY, ("<------------------------------->\n"));
 }
 
+
 static A_STATUS HIFDevAllocAndPrepareRxPackets(HIF_SDIO_DEVICE *pDev,
         A_UINT32 LookAheads[], int Messages, HTC_PACKET_QUEUE *pQueue)
 {
@@ -126,7 +126,11 @@ static A_STATUS HIFDevAllocAndPrepareRxPackets(HIF_SDIO_DEVICE *pDev,
     int numMessages;
     int fullLength;
     A_BOOL noRecycle;
+#if HIF_ASYNC_ALLOC
+    unsigned long flags;
+#endif
     HTC_TARGET *target = NULL;
+
     target = (HTC_TARGET *)pDev->pTarget;
     /* lock RX while we assemble the packet buffers */
     LOCK_HIF_DEV_RX(pDev);
@@ -166,14 +170,17 @@ static A_STATUS HIFDevAllocAndPrepareRxPackets(HIF_SDIO_DEVICE *pDev,
                     ("HTC header indicates :%d messages can be fetched as a bundle \n",numMessages));
         }
 
-        if(target->enable_b2b) {
-            if(numMessages > 1)
-                fullLength = target->TargetCreditSize;
-            else
-                fullLength = DEV_CALC_RECV_PADDED_LEN(pDev,pHdr->PayloadLen + sizeof(HTC_FRAME_HDR));
-        }
+#if HIF_BUNDLE_DIFF_BLK_FRAMES
+        if(numMessages > 1)
+            fullLength = target->TargetCreditSize;
         else
             fullLength = DEV_CALC_RECV_PADDED_LEN(pDev,pHdr->PayloadLen + sizeof(HTC_FRAME_HDR));
+#else
+        fullLength = DEV_CALC_RECV_PADDED_LEN(pDev,pHdr->PayloadLen + sizeof(HTC_FRAME_HDR));
+#endif
+#if HIF_DBG
+        printk("payl %d msg %d\n", pHdr->PayloadLen, numMessages);
+#endif
 
         /*
             all but the last packet have a length of payloadLen + sizeof(HTC_FRAME_HDR)
@@ -183,8 +190,8 @@ static A_STATUS HIFDevAllocAndPrepareRxPackets(HIF_SDIO_DEVICE *pDev,
 
         /* get packet buffers for each message, if there was a bundle detected in the header,
          * use pHdr as a template to fetch all packets in the bundle */
-#ifdef HIF_RX_THREAD
-        adf_os_spin_lock_irqsave(&pDev->pRecvTask->rx_alloc_lock);
+#if HIF_ASYNC_ALLOC
+        spin_lock_irqsave(&pDev->pRecvTask->rx_alloc_lock, flags);
 #endif
         for (j = 0; j < numMessages; j++) {
 
@@ -197,7 +204,7 @@ static A_STATUS HIFDevAllocAndPrepareRxPackets(HIF_SDIO_DEVICE *pDev,
                 fullLength += HIF_MBOX_BLOCK_SIZE;
             }
 
-#ifdef HIF_RX_THREAD
+#if HIF_ASYNC_ALLOC
             pPacket = HTC_PACKET_DEQUEUE(&pDev->pRecvTask->rxAllocQueue);
             if(pPacket == NULL) {
                 pPacket = HIFDevAllocRxBuffer(pDev, fullLength);
@@ -213,9 +220,11 @@ static A_STATUS HIFDevAllocAndPrepareRxPackets(HIF_SDIO_DEVICE *pDev,
                 status = A_NO_RESOURCE;
                 break;
             }
-#ifdef HIF_RX_THREAD
             pPacket->BundlePktnum = 0;
+#if HIF_DBG
+            printk("alloc %p\n", pPacket);
 #endif
+
             //AR_DEBUG_ASSERT(pPacket->Endpoint == pEndpoint->Id);
             /* clear flags */
             pPacket->PktInfo.AsRx.HTCRxFlags = 0;
@@ -254,26 +263,31 @@ static A_STATUS HIFDevAllocAndPrepareRxPackets(HIF_SDIO_DEVICE *pDev,
                 pPacket->PktInfo.AsRx.ExpectedHdr = 0xFFFFFFFF;
             } else {
                 pPacket->PktInfo.AsRx.ExpectedHdr = LookAheads[i]; /* set expected look ahead */
+#if HIF_DBG
+                printk("exp 0x%08X\n", LookAheads[i]);
+#endif
             }
             /* set the amount of data to fetch */
-            if(target->enable_b2b) {
-                if(numMessages > 1)
-                    pPacket->ActualLength = target->TargetCreditSize;
-                else
-                    pPacket->ActualLength = pHdr->PayloadLen + HTC_HDR_LENGTH;
-            }
+#if HIF_BUNDLE_DIFF_BLK_FRAMES
+            if(numMessages > 1)
+                pPacket->ActualLength = target->TargetCreditSize;
             else
                 pPacket->ActualLength = pHdr->PayloadLen + HTC_HDR_LENGTH;
-
+#else
+            pPacket->ActualLength = pHdr->PayloadLen + HTC_HDR_LENGTH;
+#endif
             if ((j == (numMessages-1)) && ((pHdr->Flags) & HTC_FLAGS_RECV_1MORE_BLOCK)) {
                 pPacket->PktInfo.AsRx.HTCRxFlags |=
                 HTC_RX_PKT_LAST_BUNDLED_PKT_HAS_ADDTIONAL_BLOCK;
+#if HIF_DBG
+                printk("1more block!\n");
+#endif
             }
             pPacket->Endpoint = pHdr->EndpointID;
             pPacket->Completion = NULL;
         }
-#ifdef HIF_RX_THREAD
-        adf_os_spin_unlock_irqrestore(&pDev->pRecvTask->rx_alloc_lock);
+#if HIF_ASYNC_ALLOC
+        spin_unlock_irqrestore(&pDev->pRecvTask->rx_alloc_lock, flags);
 #endif
 
         if (A_FAILED(status)) {
@@ -290,59 +304,53 @@ static A_STATUS HIFDevAllocAndPrepareRxPackets(HIF_SDIO_DEVICE *pDev,
 
     if (A_FAILED(status)) {
         while (!HTC_QUEUE_EMPTY(pQueue)) {
-            adf_nbuf_t netbuf;
-
             pPacket = HTC_PACKET_DEQUEUE(pQueue);
-            if (pPacket == NULL)
-                break;
-            netbuf = (adf_nbuf_t) pPacket->pNetBufContext;
-            if (netbuf)
-                adf_nbuf_free(netbuf);
-            }
+        }
     }
     return status;
 }
-
-#ifdef HIF_RX_THREAD
-static INLINE void HIFDevPreprocessTrailer(HIF_SDIO_DEVICE *pDev, HTC_PACKET* pPacket,
-                                           A_UINT32 LookAheads[], int *pNumLookAheads,
-                                           A_UINT32 lookAhead_part2[])
+#if HIF_RX_THREAD_V2
+static INLINE void HIFDevPreprocessTrailer(HIF_SDIO_DEVICE *pDev, HTC_PACKET* pPacket, A_UINT32 LookAheads[], int *pNumLookAheads
+#if HIF_BUNDLE_DIFF_BLK_FRAMES
+        , A_UINT32 lookAhead_part2[])
+#else
+        )
+#endif
 {
-    HTC_TARGET *target = NULL;
     A_UINT8 *pRecordBuf;
     HTC_RECORD_HDR *pRecord;
     HTC_LOOKAHEAD_REPORT *pLookAhead;
-    HTC_LOOKAHEAD_REPORTV2 *pLookAheadV2;
     A_UINT8 *pBuffer, *pLastPktBuffer, *pCur;
     A_UINT8 lastPktFlag;
     A_UINT16 lastPktPayloadLength;
     A_UINT8 lastPktRecordID;
     int numMessages;
     A_UINT8 temp;
+#if HIF_BUNDLE_DIFF_BLK_FRAMES
+#if HIF_DBG
+    A_UINT16 NextTotalLen;
+#endif
     A_UINT32 i;
+#endif
     A_UINT16 curPayloadLen = 0;
     A_UINT32 paddedLength = 0, lastPktOffset = 0;
 
-    target = (HTC_TARGET *)pDev->pTarget;
     pBuffer = pPacket->pBuffer;
     pLastPktBuffer = pBuffer;
     pCur = pBuffer;
     numMessages = GET_RECV_BUNDLE_COUNT(pBuffer[1]);
-
-    if(target->enable_b2b) {
-        for(i = 0; i < numMessages; i++) {
-            curPayloadLen = *((A_UINT16*)(&pCur[2]));
-            paddedLength = DEV_CALC_RECV_PADDED_LEN(pDev, curPayloadLen + HTC_HDR_LENGTH);
-            lastPktOffset += paddedLength;
-            pCur += paddedLength;
-        }
-    }
-    else {
-        curPayloadLen = *((A_UINT16*)(pBuffer + 2));
+#if HIF_BUNDLE_DIFF_BLK_FRAMES
+    for(i = 0; i < numMessages; i++) {
+        curPayloadLen = *((A_UINT16*)(&pCur[2]));
         paddedLength = DEV_CALC_RECV_PADDED_LEN(pDev, curPayloadLen + HTC_HDR_LENGTH);
-        lastPktOffset = numMessages * paddedLength;
+        lastPktOffset += paddedLength;
+        pCur += paddedLength;
     }
-
+#else
+    curPayloadLen = *((A_UINT16*)(pBuffer + 2));
+    paddedLength = DEV_CALC_RECV_PADDED_LEN(pDev, curPayloadLen + HTC_HDR_LENGTH);
+    lastPktOffset = numMessages * paddedLength;
+#endif
     pLastPktBuffer = pBuffer + lastPktOffset;
     lastPktFlag = pLastPktBuffer[1];
     lastPktPayloadLength = ((A_UINT16)(*(A_UINT16*)(pLastPktBuffer + 2)));
@@ -357,35 +365,31 @@ static INLINE void HIFDevPreprocessTrailer(HIF_SDIO_DEVICE *pDev, HTC_PACKET* pP
         lastPktRecordID = *(A_UINT8*)(pLastPktBuffer + lastPktPayloadLength + 8 - temp);
         pRecord = (HTC_RECORD_HDR *)(pLastPktBuffer + lastPktPayloadLength + 8 - temp);
         pRecordBuf = (A_UINT8*)(pLastPktBuffer + lastPktPayloadLength - temp + 12);
+#if HIF_DBG
+        printk("%p curPayloadLen %d padLen %d lastpkt flag %x pl %d rid %d temp %d\n", pPacket, curPayloadLen, paddedLength, lastPktFlag, lastPktPayloadLength, lastPktRecordID, temp);
+#endif
         if(lastPktRecordID == HTC_RECORD_LOOKAHEAD) {
-            if(target->enable_b2b) {
-                pLookAheadV2 = (HTC_LOOKAHEAD_REPORTV2 *) pRecordBuf;
-                if (pLookAheadV2->PreValid == ((~pLookAheadV2->PostValid) & 0xFF)) {
-                    ((A_UINT8 *) (&LookAheads[0]))[0] = pLookAheadV2->LookAhead0;
-                    ((A_UINT8 *) (&LookAheads[0]))[1] = pLookAheadV2->LookAhead1;
-                    ((A_UINT8 *) (&LookAheads[0]))[2] = pLookAheadV2->LookAhead2;
-                    ((A_UINT8 *) (&LookAheads[0]))[3] = pLookAheadV2->LookAhead3;
-
-                    ((A_UINT8 *) (&lookAhead_part2[0]))[0] = pLookAheadV2->LookAhead4;
-                    ((A_UINT8 *) (&lookAhead_part2[0]))[1] = pLookAheadV2->LookAhead5;
-                    ((A_UINT8 *) (&lookAhead_part2[0]))[2] = pLookAheadV2->LookAhead6;
-                    ((A_UINT8 *) (&lookAhead_part2[0]))[3] = pLookAheadV2->LookAhead7;
-                    if (pNumLookAheads != NULL) {
-                        *pNumLookAheads = 1;
-                    }
-                    return;
-                }
-            }
-            else {
-                pLookAhead = (HTC_LOOKAHEAD_REPORT *) pRecordBuf;
-                if (pLookAhead->PreValid == ((~pLookAhead->PostValid) & 0xFF)) {
-                    ((A_UINT8 *) (&LookAheads[0]))[0] = pLookAhead->LookAhead0;
-                    ((A_UINT8 *) (&LookAheads[0]))[1] = pLookAhead->LookAhead1;
-                    ((A_UINT8 *) (&LookAheads[0]))[2] = pLookAhead->LookAhead2;
-                    ((A_UINT8 *) (&LookAheads[0]))[3] = pLookAhead->LookAhead3;
-                    if (pNumLookAheads != NULL) {
-                        *pNumLookAheads = 1;
-                    }
+            pLookAhead = (HTC_LOOKAHEAD_REPORT *) pRecordBuf;
+            if (pLookAhead->PreValid == ((~pLookAhead->PostValid) & 0xFF)) {
+                ((A_UINT8 *) (&LookAheads[0]))[0] = pLookAhead->LookAhead0;
+                ((A_UINT8 *) (&LookAheads[0]))[1] = pLookAhead->LookAhead1;
+                ((A_UINT8 *) (&LookAheads[0]))[2] = pLookAhead->LookAhead2;
+                ((A_UINT8 *) (&LookAheads[0]))[3] = pLookAhead->LookAhead3;
+#if HIF_BUNDLE_DIFF_BLK_FRAMES
+                ((A_UINT8 *) (&lookAhead_part2[0]))[0] = pLookAhead->LookAhead4;
+                ((A_UINT8 *) (&lookAhead_part2[0]))[1] = pLookAhead->LookAhead5;
+                ((A_UINT8 *) (&lookAhead_part2[0]))[2] = pLookAhead->LookAhead6;
+                ((A_UINT8 *) (&lookAhead_part2[0]))[3] = pLookAhead->LookAhead7;
+#if HIF_DBG
+                NextTotalLen = (A_UINT16)((lookAhead_part2[0] & 0xffff0000) >> 16);
+                printk("%s next lookahead_part2 0x%08X len %d\n", __func__, lookAhead_part2[0], NextTotalLen);
+#endif
+#endif
+#if HIF_DBG
+                printk("next lookahead 2 0x%08X\n", LookAheads[0]);
+#endif
+                if (pNumLookAheads != NULL) {
+                    *pNumLookAheads = 1;
                 }
                 return;
             }
@@ -420,6 +424,9 @@ static INLINE void HIFDevPreprocessTrailer(HIF_SDIO_DEVICE *pDev, HTC_PACKET* pP
                             pBundledLookAheadRpt->LookAhead2;
                     ((A_UINT8 *) (&LookAheads[i]))[3] =
                             pBundledLookAheadRpt->LookAhead3;
+#if HIF_DBG
+                    printk("next lookahead 3 0x%08X\n", LookAheads[0]);
+#endif
                     pBundledLookAheadRpt++;
                 }
 
@@ -490,6 +497,9 @@ static INLINE A_STATUS HIFDevRecvPacket(HIF_SDIO_DEVICE *pDev,
         pPacket->Status = status;
         if (status == A_OK) {
             HTC_FRAME_HDR *pHdr = (HTC_FRAME_HDR *) pPacket->pBuffer;
+#if HIF_DBG
+            printk("lookahead in packet: 0x%08X\n", (*(A_UINT32*)pPacket->pBuffer));
+#endif
             AR_DEBUG_PRINTF(ATH_DEBUG_RECV,
                     ("HIFDevRecvPacket "
                     "EP:%d,PayloadLen:%d,Flag:%d,CB:0x%02X,0x%02X\n",
@@ -506,17 +516,24 @@ static INLINE A_STATUS HIFDevRecvPacket(HIF_SDIO_DEVICE *pDev,
 
 static INLINE A_STATUS HIFDevProcessTrailer(HIF_SDIO_DEVICE *pDev,
         A_UINT8 *pBuffer, int Length, A_UINT32 *pNextLookAheads,
-        int *pNumLookAheads, HTC_ENDPOINT_ID FromEndpoint,
-        A_UINT32 lookAhead_part2[])
+        int *pNumLookAheads, HTC_ENDPOINT_ID FromEndpoint
+#if HIF_BUNDLE_DIFF_BLK_FRAMES
+        , A_UINT32 lookAhead_part2[])
+#else
+        )
+#endif
 {
-    HTC_TARGET *target = NULL;
     HTC_RECORD_HDR *pRecord;
     A_UINT8 *pRecordBuf;
     HTC_LOOKAHEAD_REPORT *pLookAhead;
-    HTC_LOOKAHEAD_REPORTV2 *pLookAheadV2;
     A_UINT8 *pOrigBuffer;
     int origLength;
     A_STATUS status;
+#if HIF_BUNDLE_DIFF_BLK_FRAMES
+#if HIF_DBG
+    A_UINT16 NextTotalLen;
+#endif
+#endif
 
     AR_DEBUG_PRINTF(ATH_DEBUG_RECV,
             ("+HTCProcessTrailer (length:%d) \n", Length));
@@ -525,7 +542,6 @@ static INLINE A_STATUS HIFDevProcessTrailer(HIF_SDIO_DEVICE *pDev,
         AR_DEBUG_PRINTBUF(pBuffer,Length,"Recv Trailer");
     }
 
-    target = (HTC_TARGET *)pDev->pTarget;
     pOrigBuffer = pBuffer;
     origLength = Length;
     status = A_OK;
@@ -557,63 +573,41 @@ static INLINE A_STATUS HIFDevProcessTrailer(HIF_SDIO_DEVICE *pDev,
             break;
         case HTC_RECORD_LOOKAHEAD:
             AR_DEBUG_ASSERT(pRecord->Length >= sizeof(HTC_LOOKAHEAD_REPORT));
-            if(target->enable_b2b) {
-                pLookAheadV2 = (HTC_LOOKAHEAD_REPORTV2 *) pRecordBuf;
-                if ((pLookAheadV2->PreValid == ((~pLookAheadV2->PostValid) & 0xFF))
-                        && (pNextLookAheads != NULL)) {
+            pLookAhead = (HTC_LOOKAHEAD_REPORT *) pRecordBuf;
+            if ((pLookAhead->PreValid == ((~pLookAhead->PostValid) & 0xFF))
+                    && (pNextLookAheads != NULL)) {
 
-                    AR_DEBUG_PRINTF( ATH_DEBUG_RECV,
-                        (" LookAhead Report Found (pre valid:0x%X, post valid:0x%X) %d %d\n",
-                               pLookAheadV2->PreValid, pLookAheadV2->PostValid,
-                               FromEndpoint,
-                               pLookAheadV2->LookAhead0
-                               ));
-                    /* look ahead bytes are valid, copy them over */
-                    ((A_UINT8 *) (&pNextLookAheads[0]))[0] = pLookAheadV2->LookAhead0;
-                    ((A_UINT8 *) (&pNextLookAheads[0]))[1] = pLookAheadV2->LookAhead1;
-                    ((A_UINT8 *) (&pNextLookAheads[0]))[2] = pLookAheadV2->LookAhead2;
-                    ((A_UINT8 *) (&pNextLookAheads[0]))[3] = pLookAheadV2->LookAhead3;
+                AR_DEBUG_PRINTF( ATH_DEBUG_RECV,
+                    (" LookAhead Report Found (pre valid:0x%X, post valid:0x%X) %d %d\n",
+                           pLookAhead->PreValid, pLookAhead->PostValid,
+                           FromEndpoint,
+                           pLookAhead->LookAhead0
+                           ));
+                /* look ahead bytes are valid, copy them over */
+                ((A_UINT8 *) (&pNextLookAheads[0]))[0] = pLookAhead->LookAhead0;
+                ((A_UINT8 *) (&pNextLookAheads[0]))[1] = pLookAhead->LookAhead1;
+                ((A_UINT8 *) (&pNextLookAheads[0]))[2] = pLookAhead->LookAhead2;
+                ((A_UINT8 *) (&pNextLookAheads[0]))[3] = pLookAhead->LookAhead3;
 
-                    ((A_UINT8 *) (&lookAhead_part2[0]))[0] = pLookAheadV2->LookAhead4;
-                    ((A_UINT8 *) (&lookAhead_part2[0]))[1] = pLookAheadV2->LookAhead5;
-                    ((A_UINT8 *) (&lookAhead_part2[0]))[2] = pLookAheadV2->LookAhead6;
-                    ((A_UINT8 *) (&lookAhead_part2[0]))[3] = pLookAheadV2->LookAhead7;
-                    if (AR_DEBUG_LVL_CHECK(ATH_DEBUG_RECV)) {
-                        DebugDumpBytes((A_UINT8 *) pNextLookAheads,
-                                4,
-                                "Next Look Ahead");
-                    }
-                    /* just one normal lookahead */
-                    if (pNumLookAheads != NULL) {
-                        *pNumLookAheads = 1;
-                    }
+#if HIF_BUNDLE_DIFF_BLK_FRAMES
+                ((A_UINT8 *) (&lookAhead_part2[0]))[0] = pLookAhead->LookAhead4;
+                ((A_UINT8 *) (&lookAhead_part2[0]))[1] = pLookAhead->LookAhead5;
+                ((A_UINT8 *) (&lookAhead_part2[0]))[2] = pLookAhead->LookAhead6;
+                ((A_UINT8 *) (&lookAhead_part2[0]))[3] = pLookAhead->LookAhead7;
+#if HIF_DBG
+                NextTotalLen = (A_UINT16)((lookAhead_part2[0] & 0xffff0000) >> 16);
+                printk("%s next lookahead 0x%08X lookahead_part2 0x%08X len %d\n", __func__, pNextLookAheads[0], lookAhead_part2[0], NextTotalLen);
+#endif
+#endif
+
+                if (AR_DEBUG_LVL_CHECK(ATH_DEBUG_RECV)) {
+                    DebugDumpBytes((A_UINT8 *) pNextLookAheads,
+                            4,
+                            "Next Look Ahead");
                 }
-            }
-            else {
-                pLookAhead = (HTC_LOOKAHEAD_REPORT *) pRecordBuf;
-                if ((pLookAhead->PreValid == ((~pLookAhead->PostValid) & 0xFF))
-                        && (pNextLookAheads != NULL)) {
-
-                    AR_DEBUG_PRINTF( ATH_DEBUG_RECV,
-                        (" LookAhead Report Found (pre valid:0x%X, post valid:0x%X) %d %d\n",
-                               pLookAhead->PreValid, pLookAhead->PostValid,
-                               FromEndpoint,
-                               pLookAhead->LookAhead0
-                               ));
-                    /* look ahead bytes are valid, copy them over */
-                    ((A_UINT8 *) (&pNextLookAheads[0]))[0] = pLookAhead->LookAhead0;
-                    ((A_UINT8 *) (&pNextLookAheads[0]))[1] = pLookAhead->LookAhead1;
-                    ((A_UINT8 *) (&pNextLookAheads[0]))[2] = pLookAhead->LookAhead2;
-                    ((A_UINT8 *) (&pNextLookAheads[0]))[3] = pLookAhead->LookAhead3;
-                    if (AR_DEBUG_LVL_CHECK(ATH_DEBUG_RECV)) {
-                        DebugDumpBytes((A_UINT8 *) pNextLookAheads,
-                                4,
-                                "Next Look Ahead");
-                    }
-                    /* just one normal lookahead */
-                    if (pNumLookAheads != NULL) {
-                        *pNumLookAheads = 1;
-                    }
+                /* just one normal lookahead */
+                if (pNumLookAheads != NULL) {
+                    *pNumLookAheads = 1;
                 }
             }
             break;
@@ -679,13 +673,18 @@ static INLINE A_STATUS HIFDevProcessTrailer(HIF_SDIO_DEVICE *pDev,
 
     AR_DEBUG_PRINTF(ATH_DEBUG_RECV, ("-HTCProcessTrailer \n"));
     return status;
+
 }
 
 /* process a received message (i.e. strip off header, process any trailer data)
  * note : locks must be released when this function is called */
 static A_STATUS HIFDevProcessRecvHeader(HIF_SDIO_DEVICE *pDev,
-        HTC_PACKET *pPacket, A_UINT32 *pNextLookAheads, int *pNumLookAheads,
-        bool processTrailer, A_UINT32 lookAhead_part2[])
+        HTC_PACKET *pPacket, A_UINT32 *pNextLookAheads, int *pNumLookAheads, bool processTrailer
+#if HIF_BUNDLE_DIFF_BLK_FRAMES
+        , A_UINT32 lookAhead_part2[])
+#else
+        )
+#endif
 {
     A_UINT8 temp;
     A_UINT8 *pBuf;
@@ -766,9 +765,7 @@ static A_STATUS HIFDevProcessRecvHeader(HIF_SDIO_DEVICE *pDev,
             break;
         }
 
-#ifdef HIF_RX_THREAD
         if(processTrailer == TRUE) {
-#endif
             /* get flags */
             temp = HTC_GET_FIELD(pBuf, HTC_FRAME_HDR, FLAGS);
 
@@ -794,28 +791,35 @@ static A_STATUS HIFDevProcessRecvHeader(HIF_SDIO_DEVICE *pDev,
                 }
 
                 /* process trailer data that follows HDR + application payload */
+#if HIF_DBG
+                printk("recordid offset %lu payl %d tmp %d\n", HTC_HDR_LENGTH + payloadLen - temp, payloadLen, temp);
+#endif
                 status = HIFDevProcessTrailer(pDev,
                         (pBuf + HTC_HDR_LENGTH + payloadLen - temp),
                         temp,
                         pNextLookAheads,
                         pNumLookAheads,
-                        pPacket->Endpoint,
-                        lookAhead_part2);
+                        pPacket->Endpoint
+#if HIF_BUNDLE_DIFF_BLK_FRAMES
+                        , lookAhead_part2);
+#else
+                        );
+#endif
 
                 if (A_FAILED(status)) {
                     break;
                 }
             }
-#ifdef HIF_RX_THREAD
         }
-#endif
     }while (FALSE);
 
     if (A_FAILED(status)) {
         /* dump the whole packet */
+#if 0
         DebugDumpBytes(pBuf,
             pPacket->ActualLength,
             "BAD HTC Recv PKT");
+#endif
     } else {
         if (AR_DEBUG_LVL_CHECK(ATH_DEBUG_RECV)) {
             if (pPacket->ActualLength > 0) {
@@ -827,19 +831,25 @@ static A_STATUS HIFDevProcessRecvHeader(HIF_SDIO_DEVICE *pDev,
     return status;
 }
 
-#ifdef HIF_RX_THREAD
+#if HIF_RX_THREAD
 static A_STATUS processHdrAndRxComp(HIF_SDIO_DEVICE *device, HTC_PACKET *pPacket, bool processTrailer)
 {
     A_UINT8 pipeid;
     adf_nbuf_t netbuf;
     int NumLookAheads;
     A_UINT32 lookAheads[HTC_MAX_MSG_PER_BUNDLE_RX];
+#if HIF_BUNDLE_DIFF_BLK_FRAMES
     A_UINT32 lookAhead_part2[HTC_MAX_MSG_PER_BUNDLE_RX];
+#endif
     A_STATUS status = A_OK;
 
     NumLookAheads = 0;
-    status = HIFDevProcessRecvHeader(device, pPacket, lookAheads, &NumLookAheads,
-                                     processTrailer, lookAhead_part2);
+    status = HIFDevProcessRecvHeader(device, pPacket, lookAheads, &NumLookAheads, processTrailer
+#if HIF_BUNDLE_DIFF_BLK_FRAMES
+        , lookAhead_part2);
+#else
+            );
+#endif
     if (A_FAILED(status)) {
         return status;
     }
@@ -861,6 +871,9 @@ int rx_completion_task(void *param)
 {
     HIF_SDIO_DEVICE *device;
     HTC_PACKET *pPacket = NULL;
+    unsigned long flags;
+    unsigned long flags_rx;
+#if HIF_RX_THREAD_V2
     HTC_PACKET *pPacketRxBundle;
     A_UINT32 paddedLength;
     unsigned char    *pBundleBuffer = NULL;
@@ -868,12 +881,16 @@ int rx_completion_task(void *param)
     HTC_TARGET *target = NULL;
     A_UINT8 syncQDepth = 0;
     A_UINT8 nextIsSingle = 0;
+#if HIF_BUNDLE_DIFF_BLK_FRAMES
     A_UINT16 curPayloadLen = 0;
+#endif
+#endif
     A_STATUS status = A_OK;
-	int rx_buf_size;
 
     device = (HIF_SDIO_DEVICE *)param;
+#if HIF_RX_THREAD_V2
     target = (HTC_TARGET *)device->pTarget;
+#endif
     AR_DEBUG_PRINTF(ATH_DEBUG_TRACE, ("AR6000: rx completion task\n"));
 #if 0
     set_current_state(TASK_INTERRUPTIBLE);
@@ -894,22 +911,32 @@ int rx_completion_task(void *param)
                 break;
         }
 
+#if HIF_RX_THREAD_V2
         //process single packet
-        adf_os_spin_lock_irqsave(&device->pRecvTask->rx_bundle_lock);
+#if HIF_DBG
+        printk("[task]task enter\n");
+#endif
+        spin_lock_irqsave(&device->pRecvTask->rx_bundle_lock, flags_rx);
         if(HTC_QUEUE_EMPTY(&device->pRecvTask->rxBundleQueue)) {
-            adf_os_spin_lock_irqsave(&device->pRecvTask->rx_sync_completion_lock);
+            spin_lock_irqsave(&device->pRecvTask->rx_sync_completion_lock, flags);
             while(!HTC_QUEUE_EMPTY(&device->pRecvTask->rxSyncCompletionQueue)) {
                 pPacket = HTC_PACKET_DEQUEUE(&device->pRecvTask->rxSyncCompletionQueue);
                 if(pPacket == NULL) {
                     break;
                 }
+#if HIF_DBG
+                printk("[task]process single %p\n", pPacket);
+#endif
                 status = processHdrAndRxComp(device, pPacket, FALSE);
 
                 if (A_FAILED(status)) {
                     break;
                 }
+#if HIF_DBG
+                printk("[task]process single done %p\n", pPacket);
+#endif
             }
-            adf_os_spin_unlock_irqrestore(&device->pRecvTask->rx_sync_completion_lock);
+            spin_unlock_irqrestore(&device->pRecvTask->rx_sync_completion_lock, flags);
         }
         else {
             //1. Dequeue from bundle buffer queue, scatter data to sync completion queue
@@ -919,23 +946,25 @@ int rx_completion_task(void *param)
                     break;
                 }
                 if(pPacketRxBundle->BundlePktnum < 1) {
-                    AR_DEBUG_PRINTF(ATH_DEBUG_WARN, ("Packets in bundle buffer is < 1"));
+                    printk("[task]Packets in bundle buffer is < 1\n");
                     break;
                 }
-                adf_os_spin_lock_irqsave(&device->pRecvTask->rx_sync_completion_lock);
+                spin_lock_irqsave(&device->pRecvTask->rx_sync_completion_lock, flags);
                 if(HTC_PACKET_QUEUE_DEPTH(&device->pRecvTask->rxSyncCompletionQueue) < pPacketRxBundle->BundlePktnum) {
-                    // corner case: the sync queue depth is not enough for processing this bundle pkt, push it back
+#if HIF_DBG
+                    printk("corner case: the sync queue depth is not enough for processing this bundle pkt, push it back\n");
+#endif
                     HTC_PACKET_ENQUEUE_TO_HEAD(&device->pRecvTask->rxBundleQueue, pPacketRxBundle);
-                    adf_os_spin_unlock_irqrestore(&device->pRecvTask->rx_sync_completion_lock);
+                    spin_unlock_irqrestore(&device->pRecvTask->rx_sync_completion_lock, flags);
                     break;
                 }
-                adf_os_spin_unlock_irqrestore(&device->pRecvTask->rx_sync_completion_lock);
+                spin_unlock_irqrestore(&device->pRecvTask->rx_sync_completion_lock, flags);
                 pBundleBuffer = pPacketRxBundle->pBuffer;
                 pBuffer = pBundleBuffer;
                 if(pPacketRxBundle == NULL)
                     break;
 
-                adf_os_spin_lock_irqsave(&device->pRecvTask->rx_sync_completion_lock);
+                spin_lock_irqsave(&device->pRecvTask->rx_sync_completion_lock, flags);
                 //if the next pkt is single, dequeue it and process it, until the bundle pkts
                 while(TRUE) {
                     nextIsSingle = 0;
@@ -943,6 +972,9 @@ int rx_completion_task(void *param)
                     if(pPacket == NULL)
                         break;
                     if(pPacket->BundlePktnum == 1) {
+#if HIF_DBG
+                        printk("[task]the next is singlepkt, dequeue it %p\n", pPacket);
+#endif
                         nextIsSingle = 1;
                     }
                     if(nextIsSingle == 1) {
@@ -961,25 +993,30 @@ int rx_completion_task(void *param)
                 }
 
                 //2. Dequeue from sync completion queue for processing header, the trialer info at this point is useless.
+#if HIF_DBG
+                printk("[task]process bundle %p %d\n", pPacketRxBundle, pPacketRxBundle->BundlePktnum);
+#endif
                 syncQDepth = 0;
                 while(!HTC_QUEUE_EMPTY(&device->pRecvTask->rxSyncCompletionQueue)) {
                     pPacket = HTC_PACKET_DEQUEUE(&device->pRecvTask->rxSyncCompletionQueue);
                     if(pPacket == NULL)
                         break;
                     syncQDepth++;
-                    if(target->enable_b2b) {
-                        curPayloadLen = *(A_UINT16*)(&pBuffer[2]);
-                        pPacket->ActualLength = curPayloadLen + HTC_HDR_LENGTH;
-                        paddedLength = DEV_CALC_RECV_PADDED_LEN(device, pPacket->ActualLength);
+#if HIF_BUNDLE_DIFF_BLK_FRAMES
+                    curPayloadLen = *(A_UINT16*)(&pBuffer[2]);
+                    pPacket->ActualLength = curPayloadLen + HTC_HDR_LENGTH;
+                    paddedLength = DEV_CALC_RECV_PADDED_LEN(device, pPacket->ActualLength);
+#else
+                    paddedLength = DEV_CALC_RECV_PADDED_LEN(device, pPacket->ActualLength);
+                    if (pPacket->PktInfo.AsRx.HTCRxFlags & HTC_RX_PKT_LAST_BUNDLED_PKT_HAS_ADDTIONAL_BLOCK){
+                            paddedLength += HIF_MBOX_BLOCK_SIZE;
                     }
-                    else {
-                        paddedLength = DEV_CALC_RECV_PADDED_LEN(device, pPacket->ActualLength);
-                        if (pPacket->PktInfo.AsRx.HTCRxFlags & HTC_RX_PKT_LAST_BUNDLED_PKT_HAS_ADDTIONAL_BLOCK){
-                                paddedLength += HIF_MBOX_BLOCK_SIZE;
-                        }
-                    }
+#endif
                     A_MEMCPY(pPacket->pBuffer, pBuffer, paddedLength);
                     pBuffer += paddedLength;
+#if HIF_DBG
+                    printk("[task]process %p %d\n", pPacket, syncQDepth);
+#endif
                     status = processHdrAndRxComp(device, pPacket, FALSE);
                     if (A_FAILED(status)) {
                         break;
@@ -988,6 +1025,9 @@ int rx_completion_task(void *param)
                     if(syncQDepth > (pPacketRxBundle->BundlePktnum - 1))
                         break;
                 }
+#if HIF_DBG
+                printk("[task]process bundle done %p %d\n", pPacketRxBundle, syncQDepth);
+#endif
                 //if the next pkt is single, dequeue it and process it, until the bundle pkts
                 while(TRUE) {
                     nextIsSingle = 0;
@@ -995,6 +1035,9 @@ int rx_completion_task(void *param)
                     if(pPacket == NULL)
                         break;
                     if(pPacket->BundlePktnum == 1) {
+#if HIF_DBG
+                        printk("[task]the next is singlepkt, dequeue it %p\n", pPacket);
+#endif
                         nextIsSingle = 1;
                     }
                     if(nextIsSingle == 1) {
@@ -1009,54 +1052,102 @@ int rx_completion_task(void *param)
                     else
                         break;
                 }
-                adf_os_spin_unlock_irqrestore(&device->pRecvTask->rx_sync_completion_lock);
+                spin_unlock_irqrestore(&device->pRecvTask->rx_sync_completion_lock, flags);
                 FreeHTCBundleRxPacket(target, pPacketRxBundle);
             }
         }
-        adf_os_spin_unlock_irqrestore(&device->pRecvTask->rx_bundle_lock);
+        spin_unlock_irqrestore(&device->pRecvTask->rx_bundle_lock, flags_rx);
+#else
+        spin_lock_irqsave(&device->pRecvTask->rx_completion_lock, flags);
+        while(!HTC_QUEUE_EMPTY(&device->pRecvTask->rxComQueue)) {
+            pPacket = HTC_PACKET_DEQUEUE(&device->pRecvTask->rxComQueue);
+            if(pPacket == NULL)
+                break;
+
+            status = processHdrAndRxComp(device, pPacket, FALSE);
+            if (A_FAILED(status)) {
+                break;
+            }
+        }
+        spin_unlock_irqrestore(&device->pRecvTask->rx_completion_lock, flags);
+
+#endif
+
+#if HIF_ASYNC_ALLOC
         //alloc skb for next bundle
-        adf_os_spin_lock_irqsave(&device->pRecvTask->rx_alloc_lock);
+        spin_lock_irqsave(&device->pRecvTask->rx_alloc_lock, flags);
         while(HTC_PACKET_QUEUE_DEPTH(&device->pRecvTask->rxAllocQueue) < 64) {
-            //pPacket = HIFDevAllocRxBuffer(device, target->TargetCreditSize);
-            rx_buf_size = (target->TargetCreditSize == 0) ? MAX_CREDIT_SIZE:
-                (target->TargetCreditSize + HIF_MBOX_BLOCK_SIZE);
-            pPacket = HIFDevAllocRxBuffer(device, rx_buf_size);
+            pPacket = HIFDevAllocRxBuffer(device, 2048);
             if(pPacket == NULL) {
-                AR_DEBUG_PRINTF(ATH_DEBUG_ERR, ("Short of mem, alloc failed"));
+                printk("[task]%s allocate failed\n", __func__);
                 break;
             }
             HTC_PACKET_ENQUEUE(&device->pRecvTask->rxAllocQueue, pPacket);
         }
-        adf_os_spin_unlock_irqrestore(&device->pRecvTask->rx_alloc_lock);
+        spin_unlock_irqrestore(&device->pRecvTask->rx_alloc_lock, flags);
+#endif
+#if HIF_DBG
+        printk("[task]task break\n");
+#endif
     }
+        printk("in_atomic(): %d, irqs_disabled(): %d, pid: %d, name: %s\n",in_atomic(), irqs_disabled(),current->pid, current->comm);
     complete_and_exit(&device->pRecvTask->rx_completion_exit, 0);
     return 0;
 }
 #endif
 
+#if HIF_COSTTIME
+unsigned long gt0=0;
+unsigned long gt1=0;
+unsigned long gt2=0;
+unsigned long gt3=0;
+unsigned long gt4=0;
+unsigned long gt5=0;
+unsigned long gt6=0;
+unsigned long gt7=0;
+int gBundleCnt=0;
+int gMaxBundleCnt=0;
+#endif
 static A_STATUS HIFDevIssueRecvPacketBundle(HIF_SDIO_DEVICE *pDev,
         HTC_PACKET_QUEUE *pRecvPktQueue,
         HTC_PACKET_QUEUE *pSyncCompletionQueue,
         A_UINT8 MailBoxIndex,
         int *pNumPacketsFetched,
         A_BOOL  PartialBundle
-#ifdef HIF_RX_THREAD
+#if !HIF_RX_THREAD_V2
+#if HIF_BUNDLE_DIFF_BLK_FRAMES
+        , A_UINT32 lookAhead_part2[])
+#else
+        )
+#endif
+#else
         , int *pNumLookAheads
         , A_UINT32 LookAheads[]
-#endif
-        , A_UINT32 lookAhead_part2[]
+#if HIF_BUNDLE_DIFF_BLK_FRAMES
+        , A_UINT32 lookAhead_part2[])
+#else
         )
+#endif
+#endif
 { A_STATUS status = A_OK;
     int i, totalLength = 0;
     unsigned char    *pBundleBuffer = NULL;
     HTC_PACKET *pPacket, *pPacketRxBundle;
     HTC_TARGET *target = NULL;
     A_UINT32 paddedLength;
-#ifdef HIF_RX_THREAD
-#else
-    unsigned char *pBuffer = NULL;
-    A_UINT16 curPayloadLen = 0;
+#if HIF_COSTTIME
+    struct timeval tv;
 #endif
+#if HIF_RX_THREAD_V2
+    unsigned long flags;
+#endif
+#if (HIF_BUNDLE_DIFF_BLK_FRAMES && !HIF_RX_THREAD_V2)
+    A_UINT16 curPayloadLen = 0;
+#if HIF_DBG
+    A_UINT32 totalPadLength = 0;
+#endif
+#endif
+
     int bundleSpaceRemaining = 0;
     target = (HTC_TARGET *)pDev->pTarget;
 
@@ -1108,8 +1199,15 @@ static A_STATUS HIFDevIssueRecvPacketBundle(HIF_SDIO_DEVICE *pDev,
 
         totalLength += paddedLength;
     }
-    if(target->enable_b2b)
-        totalLength = (A_UINT16)((lookAhead_part2[0] & 0xffff0000) >> 16);
+#if HIF_DBG
+    printk("alloc bundle %p\n", pPacketRxBundle);
+#endif
+#if HIF_BUNDLE_DIFF_BLK_FRAMES
+    totalLength = (A_UINT16)((lookAhead_part2[0] & 0xffff0000) >> 16);
+#endif
+#if HIF_DBG
+    printk("total %d\n", totalLength);
+#endif
 #if DEBUG_BUNDLE
     adf_os_print("Recv bundle count %d, length %d.\n",
        HTC_PACKET_QUEUE_DEPTH(pSyncCompletionQueue), totalLength);
@@ -1140,64 +1238,257 @@ static A_STATUS HIFDevIssueRecvPacketBundle(HIF_SDIO_DEVICE *pDev,
     if(status != A_OK){
         AR_DEBUG_PRINTF(ATH_DEBUG_ERR, ("%s, HIFSend Failed status:%d \n",__FUNCTION__, status));
     }else{
-#ifdef HIF_RX_THREAD
-        HIFDevPreprocessTrailer(pDev, pPacketRxBundle, LookAheads,
-                                pNumLookAheads, lookAhead_part2);
+#if !HIF_RX_THREAD_V2
+        unsigned char *pBuffer = pBundleBuffer;
+#endif
+
+#if HIF_RX_THREAD_V2
+        HIFDevPreprocessTrailer(pDev, pPacketRxBundle, LookAheads, pNumLookAheads
+#if HIF_BUNDLE_DIFF_BLK_FRAMES
+                    , lookAhead_part2);
+#else
+                );
+#endif
         *pNumPacketsFetched = i;
         pPacketRxBundle->BundlePktnum = i;
-        adf_os_spin_lock_irqsave(&pDev->pRecvTask->rx_bundle_lock);
-        HTC_PACKET_ENQUEUE(&pDev->pRecvTask->rxBundleQueue, pPacketRxBundle);
-        adf_os_spin_unlock_irqrestore(&pDev->pRecvTask->rx_bundle_lock);
+#if HIF_DBG
+        printk("bundle read %d\n", i);
+#endif
 
-        adf_os_spin_lock_irqsave(&pDev->pRecvTask->rx_sync_completion_lock);
-        HTC_PACKET_QUEUE_TRANSFER_TO_TAIL(&pDev->pRecvTask->rxSyncCompletionQueue,
-                                          pSyncCompletionQueue);
-        adf_os_spin_unlock_irqrestore(&pDev->pRecvTask->rx_sync_completion_lock);
+        spin_lock_irqsave(&pDev->pRecvTask->rx_bundle_lock, flags);
+        HTC_PACKET_ENQUEUE(&pDev->pRecvTask->rxBundleQueue, pPacketRxBundle);
+        spin_unlock_irqrestore(&pDev->pRecvTask->rx_bundle_lock, flags);
+
+        spin_lock_irqsave(&pDev->pRecvTask->rx_sync_completion_lock, flags);
+        HTC_PACKET_QUEUE_TRANSFER_TO_TAIL(&pDev->pRecvTask->rxSyncCompletionQueue, pSyncCompletionQueue);
+        spin_unlock_irqrestore(&pDev->pRecvTask->rx_sync_completion_lock, flags);
 #else
         *pNumPacketsFetched = i;
-        pBuffer = pBundleBuffer;
         HTC_PACKET_QUEUE_ITERATE_ALLOW_REMOVE(pSyncCompletionQueue, pPacket){
-            if(target->enable_b2b) {
-                curPayloadLen = *(A_UINT16*)(&pBuffer[2]);
-                pPacket->ActualLength = curPayloadLen + HTC_HDR_LENGTH;
-                paddedLength = DEV_CALC_RECV_PADDED_LEN(pDev, pPacket->ActualLength);
+#if HIF_BUNDLE_DIFF_BLK_FRAMES
+            curPayloadLen = *(A_UINT16*)(&pBuffer[2]);
+            pPacket->ActualLength = curPayloadLen + HTC_HDR_LENGTH;
+            paddedLength = DEV_CALC_RECV_PADDED_LEN(pDev, pPacket->ActualLength);
+#else
+            paddedLength = DEV_CALC_RECV_PADDED_LEN(pDev, pPacket->ActualLength);
+            if (pPacket->PktInfo.AsRx.HTCRxFlags & HTC_RX_PKT_LAST_BUNDLED_PKT_HAS_ADDTIONAL_BLOCK){
+                    paddedLength += HIF_MBOX_BLOCK_SIZE;
             }
-            else {
-                paddedLength = DEV_CALC_RECV_PADDED_LEN(pDev, pPacket->ActualLength);
-                if (pPacket->PktInfo.AsRx.HTCRxFlags & HTC_RX_PKT_LAST_BUNDLED_PKT_HAS_ADDTIONAL_BLOCK) {
-                        paddedLength += HIF_MBOX_BLOCK_SIZE;
-                }
-            }
+#endif
+#if HIF_BUNDLE_DIFF_BLK_FRAMES
+#if HIF_DBG
+            totalPadLength += paddedLength;
+            printk("payl %d padl %d\n", curPayloadLen, paddedLength);
+#endif
+#endif
             A_MEMCPY(pPacket->pBuffer, pBuffer, paddedLength);
             pBuffer += paddedLength;
         }HTC_PACKET_QUEUE_ITERATE_END;
+#if HIF_BUNDLE_DIFF_BLK_FRAMES
+#if HIF_DBG
+        if(totalPadLength != totalLength)
+            printk("ERROR: driver calc total len %d fw indicated total len %d\n", totalPadLength, totalLength);
+#endif
+#endif
+#endif
+#if HIF_COSTTIME
+        do_gettimeofday(&tv);
+        gt6 = tv.tv_sec*1000000 + tv.tv_usec;
 #endif
     }
-#ifndef HIF_RX_THREAD
     /* free bundle space under Sync mode */
+#if !HIF_RX_THREAD_V2
     FreeHTCBundleRxPacket(target, pPacketRxBundle);
 #endif
     return status;
 }
 
+#if HIF_SCATTER_GATHER
+A_STATUS HIFDevIssueRecvPacketBundleSG(HIF_SDIO_DEVICE *pDev,
+        HTC_PACKET_QUEUE *pRecvPktQueue,
+        HTC_PACKET_QUEUE *pSyncCompletionQueue,
+        A_UINT8 MailBoxIndex,
+        int *pNumPacketsFetched,
+        A_BOOL  PartialBundle)
+{
+    A_STATUS        status = A_OK;
+    HIF_SCATTER_REQ *pScatterReq;
+    int             i, totalLength;
+    int             pktsToScatter;
+    HTC_PACKET      *pPacket;
+    //A_BOOL          asyncMode = (pSyncCompletionQueue == NULL) ? TRUE : FALSE;
+    A_BOOL          asyncMode = FALSE;
+    int             scatterSpaceRemaining;
+#if HIF_COSTTIME
+    struct timeval tv;
+#endif
+
+    HTC_TARGET *target = NULL;
+    target = (HTC_TARGET *)pDev->pTarget;
+
+    //AR_DEBUG_PRINTF(ATH_DEBUG_WARN, ("+%s pSyncCompletionQueue = %p\n", __func__, pSyncCompletionQueue));
+
+    pktsToScatter = HTC_PACKET_QUEUE_DEPTH(pRecvPktQueue);
+    pktsToScatter = min(pktsToScatter, HTC_MAX_MSG_PER_BUNDLE_RX);
+
+
+    if ((HTC_PACKET_QUEUE_DEPTH(pRecvPktQueue) - pktsToScatter) > 0)
+    {
+            /* we were forced to split this bundle receive operation
+             * all packets in this partial bundle must have their lookaheads ignored */
+        PartialBundle = TRUE;
+            /* this would only happen if the target ignored our max bundle limit */
+        AR_DEBUG_PRINTF(ATH_DEBUG_WARN, ("%s : partial bundle detected num:%d , %d \n", __func__, HTC_PACKET_QUEUE_DEPTH(pRecvPktQueue), pktsToScatter));
+    }
+
+    totalLength = 0;
+
+    AR_DEBUG_PRINTF(ATH_DEBUG_RECV,("+%s (Numpackets: %d , actual : %d) \n", __func__, HTC_PACKET_QUEUE_DEPTH(pRecvPktQueue), pktsToScatter));
+
+    do {
+
+        scatterSpaceRemaining = HTC_MAX_MSG_PER_BUNDLE_RX * target->TargetCreditSize;
+        pScatterReq = DEV_ALLOC_SCATTER_REQ(pDev);
+
+        if (pScatterReq == NULL) {
+            AR_DEBUG_PRINTF(ATH_DEBUG_ERROR,("%s  no scatter resources left \n", __func__));
+            break;
+        }
+
+        pScatterReq->CallerFlags = 0;
+
+        if (PartialBundle) {
+                /* mark that this is a partial bundle, this has special ramifications to the
+                 * scatter completion routine */
+            pScatterReq->CallerFlags |= HTC_SCATTER_REQ_FLAGS_PARTIAL_BUNDLE;
+        }
+
+            /* convert HTC packets to scatter list */
+        for (i = 0; i < pktsToScatter; i++)
+        {
+            int paddedLength;
+
+            pPacket = HTC_PACKET_DEQUEUE(pRecvPktQueue);
+            A_ASSERT(pPacket != NULL);
+            if (pPacket == NULL)
+                return A_ERROR;
+
+            paddedLength = DEV_CALC_RECV_PADDED_LEN(pDev, pPacket->ActualLength);
+
+            if ((scatterSpaceRemaining - paddedLength) < 0) {
+                    /* exceeds what we can transfer, put the packet back */
+                HTC_PACKET_ENQUEUE_TO_HEAD(pRecvPktQueue,pPacket);
+                break;
+            }
+
+            scatterSpaceRemaining -= paddedLength;
+
+            if (PartialBundle || (i < (pktsToScatter - 1))) {
+                    /* packet 0..n-1 cannot be checked for look-aheads since we are fetching a bundle
+                     * the last packet however can have it's lookahead used */
+                pPacket->PktInfo.AsRx.HTCRxFlags |= HTC_RX_PKT_IGNORE_LOOKAHEAD;
+            }
+
+            /* note: 1 HTC packet per scatter entry */
+                    /* setup packet into */
+            pScatterReq->ScatterList[i].pBuffer = pPacket->pBuffer;
+            pScatterReq->ScatterList[i].Length = paddedLength;
+
+            pPacket->PktInfo.AsRx.HTCRxFlags |= HTC_RX_PKT_PART_OF_BUNDLE;
+
+            if (asyncMode) {
+                    /* save HTC packet for async completion routine */
+                pScatterReq->ScatterList[i].pCallerContexts[0] = pPacket;
+            } else {
+                    /* queue to caller's sync completion queue, caller will unload this when we return */
+                HTC_PACKET_ENQUEUE(pSyncCompletionQueue,pPacket);
+            }
+
+            A_ASSERT(pScatterReq->ScatterList[i].Length);
+            totalLength += pScatterReq->ScatterList[i].Length;
+        }
+
+        pScatterReq->TotalLength = totalLength;
+        pScatterReq->ValidScatterEntries = i;
+
+#if HIF_COSTTIME
+        do_gettimeofday(&tv);
+        gt2 = tv.tv_sec*1000000 + tv.tv_usec;
+        printk("memcpy cost %lu us + rxcomp cost %lu us + alloc cost %lu us \n", gt6-gt3, gt5-gt4, gt2-gt1);
+        if(gt2 > gt3)
+            printk("bundle read gap %lu us\n", gt2-gt3);
+#endif
+        status = HIFDevSubmitScatterRequest(pDev, pScatterReq, DEV_SCATTER_READ, asyncMode);
+
+#if HIF_COSTTIME
+        do_gettimeofday(&tv);
+        gt3 = tv.tv_sec*1000000 + tv.tv_usec;
+        gBundleCnt++;
+        if(gMaxBundleCnt < gBundleCnt)
+            gMaxBundleCnt = gBundleCnt;
+        printk("bundle read cost %lu us gBundleCnt %d max %d\n", gt3-gt2, gBundleCnt, gMaxBundleCnt);
+#endif
+        if (A_SUCCESS(status)) {
+            *pNumPacketsFetched = i;
+        }
+
+        if (!asyncMode) {
+                /* free scatter request */
+            DEV_FREE_SCATTER_REQ(pDev, pScatterReq);
+        }
+
+    } while (FALSE);
+
+#if HIF_COSTTIME
+        do_gettimeofday(&tv);
+        gt6 = tv.tv_sec*1000000 + tv.tv_usec;
+#endif
+    AR_DEBUG_PRINTF(ATH_DEBUG_RECV,("-HTCIssueRecvPacketBundle (status:%d) (fetched:%d) \n",
+            status,*pNumPacketsFetched));
+
+    return status;
+}
+#endif
+
+#if HIF_DBG
+unsigned long singlenum = 0;
+int printcnd = 0;
+#endif
 A_STATUS HIFDevRecvMessagePendingHandler(HIF_SDIO_DEVICE *pDev,
         A_UINT8 MailBoxIndex,
         A_UINT32 MsgLookAheads[],
         int NumLookAheads,
         A_BOOL *pAsyncProc,
-        int *pNumPktsFetched,
-        A_UINT32 LookAhead_Part2[])
+        int *pNumPktsFetched
+#if HIF_BUNDLE_DIFF_BLK_FRAMES
+        , A_UINT32 LookAhead_Part2[])
+#else
+        )
+#endif
 {
     A_STATUS status = A_OK;
     HTC_PACKET *pPacket;
     A_BOOL asyncProc = FALSE;
     A_UINT32 lookAheads[HTC_MAX_MSG_PER_BUNDLE_RX];
+#if HIF_BUNDLE_DIFF_BLK_FRAMES
     A_UINT32 lookAhead_part2[HTC_MAX_MSG_PER_BUNDLE_RX];
+#endif
     int pktsFetched;
     HTC_PACKET_QUEUE recvPktQueue, syncCompletedPktsQueue;
     A_BOOL partialBundle;
     HTC_ENDPOINT_ID id;
     int totalFetched = 0;
+#if HIF_RX_THREAD
+    unsigned long flags;
+#endif
+#if HIF_COSTTIME
+    struct timeval tv;
+#endif
+#if HIF_BUNDLE_DIFF_BLK_FRAMES
+#if HIF_DBG
+    A_UINT16 total_len;
+#endif
+#endif
 
     HTC_TARGET *target = NULL;
 
@@ -1224,7 +1515,9 @@ A_STATUS HIFDevRecvMessagePendingHandler(HIF_SDIO_DEVICE *pDev,
         return A_EPROTO;
     }
     A_MEMCPY(lookAheads, MsgLookAheads, (sizeof(A_UINT32)) * NumLookAheads);
+#if HIF_BUNDLE_DIFF_BLK_FRAMES
     A_MEMCPY(lookAhead_part2, LookAhead_Part2, (sizeof(A_UINT32)) * NumLookAheads);
+#endif
 
     target = (HTC_TARGET *)pDev->pTarget;
     id = ((HTC_FRAME_HDR *) &lookAheads[0])->EndpointID;
@@ -1238,6 +1531,10 @@ A_STATUS HIFDevRecvMessagePendingHandler(HIF_SDIO_DEVICE *pDev,
 
     while (TRUE) {
 
+#if HIF_COSTTIME
+        do_gettimeofday(&tv);
+        gt1 = tv.tv_sec*1000000 + tv.tv_usec;
+#endif
         /* reset packets queues */
         INIT_HTC_PACKET_QUEUE(&recvPktQueue);
         INIT_HTC_PACKET_QUEUE(&syncCompletedPktsQueue);
@@ -1250,11 +1547,24 @@ A_STATUS HIFDevRecvMessagePendingHandler(HIF_SDIO_DEVICE *pDev,
         id = ((HTC_FRAME_HDR *) &lookAheads[0])->EndpointID;
 
         if (id >= ENDPOINT_MAX) {
+#if HIF_DBG
+            if(printcnd == 0) {
+            printcnd = 1;
+#endif
             AR_DEBUG_PRINTF(ATH_DEBUG_ERR,
                     ("MsgPend, Invalid Endpoint in look-ahead: %d \n",id));
+#if HIF_DBG
+            }
+#endif
             status = A_EPROTO;
             break;
         }
+#if HIF_BUNDLE_DIFF_BLK_FRAMES
+#if HIF_DBG
+        total_len = (A_UINT16)(((lookAhead_part2[0] & 0xffff0000)) >> 16);
+        printk("%s total_len %d\n", __func__, total_len);
+#endif
+#endif
         /* try to allocate as many HTC RX packets indicated by the lookaheads
          * these packets are stored in the recvPkt queue */
         status = HIFDevAllocAndPrepareRxPackets(pDev,
@@ -1276,18 +1586,44 @@ A_STATUS HIFDevRecvMessagePendingHandler(HIF_SDIO_DEVICE *pDev,
             pktsFetched = 0;
             if ((HTC_PACKET_QUEUE_DEPTH(&recvPktQueue) > 1)) {
                 /* there are enough packets to attempt a bundle transfer and recv bundling is allowed  */
+#if HIF_SCATTER_GATHER
+                if (!pDev->HIFDevice->scatter_enabled)
+#endif
+                {
                     status = HIFDevIssueRecvPacketBundle(pDev,
                             &recvPktQueue,
                             asyncProc ? NULL : &syncCompletedPktsQueue,
                             MailBoxIndex,
                             &pktsFetched,
                             partialBundle
-#ifdef HIF_RX_THREAD
+#if !HIF_RX_THREAD_V2
+#if HIF_BUNDLE_DIFF_BLK_FRAMES
+                            , lookAhead_part2);
+#else
+                            );
+#endif
+#else
                             , &NumLookAheads
                             , lookAheads
-#endif
-                            , lookAhead_part2
+#if HIF_BUNDLE_DIFF_BLK_FRAMES
+                            , lookAhead_part2);
+#else
                             );
+#endif
+#endif
+                }
+#if HIF_SCATTER_GATHER
+                else
+                {
+                    status = HIFDevIssueRecvPacketBundleSG(pDev,
+                            &recvPktQueue,
+                            asyncProc ? NULL : &syncCompletedPktsQueue,
+                            MailBoxIndex,
+                            &pktsFetched,
+                            partialBundle);
+                }
+#endif
+
                 if (A_FAILED(status)) {
                     while (!HTC_QUEUE_EMPTY(&recvPktQueue)) {
                         adf_nbuf_t netbuf;
@@ -1344,27 +1680,26 @@ A_STATUS HIFDevRecvMessagePendingHandler(HIF_SDIO_DEVICE *pDev,
                 /* go fetch the packet */
                 status = HIFDevRecvPacket(pDev, pPacket, pPacket->ActualLength, MailBoxIndex);
                 if (A_FAILED(status)) {
-                    while (!HTC_QUEUE_EMPTY(&recvPktQueue)) {
-                        adf_nbuf_t netbuf;
-
-                        pPacket = HTC_PACKET_DEQUEUE(&recvPktQueue);
-                        if (pPacket == NULL)
-                            break;
-                        netbuf = (adf_nbuf_t) pPacket->pNetBufContext;
-                        if (netbuf)
-                            adf_nbuf_free(netbuf);
-                    }
                     break;
                 }
                 /* sent synchronously, queue this packet for synchronous completion */
-#ifdef HIF_RX_THREAD
+#if HIF_RX_THREAD_V2
                 NumLookAheads = 0;
-                HIFDevPreprocessTrailer(pDev, pPacket, lookAheads,
-                                        &NumLookAheads, lookAhead_part2);
+                HIFDevPreprocessTrailer(pDev, pPacket, lookAheads, &NumLookAheads
+#if HIF_BUNDLE_DIFF_BLK_FRAMES
+                    , lookAhead_part2);
+#else
+                        );
+#endif
+
+#if HIF_DBG
+                printk("got single %p 0x%08X singlenum %lu len %d trailer %d\n", pPacket, *(A_UINT32*)pPacket->pBuffer, ++singlenum, pPacket->ActualLength, NumLookAheads);
+#endif
+
                 pPacket->BundlePktnum = 1;
-                adf_os_spin_lock_irqsave(&pDev->pRecvTask->rx_sync_completion_lock);
+                spin_lock_irqsave(&pDev->pRecvTask->rx_sync_completion_lock, flags);
                 HTC_PACKET_ENQUEUE(&pDev->pRecvTask->rxSyncCompletionQueue, pPacket);
-                adf_os_spin_unlock_irqrestore(&pDev->pRecvTask->rx_sync_completion_lock);
+                spin_unlock_irqrestore(&pDev->pRecvTask->rx_sync_completion_lock, flags);
 #else
                 HTC_PACKET_ENQUEUE(&syncCompletedPktsQueue, pPacket);
 #endif
@@ -1379,7 +1714,37 @@ A_STATUS HIFDevRecvMessagePendingHandler(HIF_SDIO_DEVICE *pDev,
 
         /* in the sync case, all packet buffers are now filled,
          * we can process each packet, check lookaheads and then repeat */
-#ifdef HIF_RX_THREAD
+
+#if HIF_COSTTIME
+        do_gettimeofday(&tv);
+        gt4 = tv.tv_sec*1000000 + tv.tv_usec;
+#endif
+
+#if HIF_RX_THREAD
+#if !HIF_RX_THREAD_V2
+        while (!HTC_QUEUE_EMPTY(&syncCompletedPktsQueue)) {
+            pPacket = HTC_PACKET_DEQUEUE(&syncCompletedPktsQueue);
+            if (pPacket == NULL)
+                break;
+
+            NumLookAheads = 0;
+            status = HIFDevProcessRecvHeader(pDev, pPacket, lookAheads, &NumLookAheads, TRUE
+#if HIF_BUNDLE_DIFF_BLK_FRAMES
+                    , lookAhead_part2);
+#else
+                    );
+#endif
+            if (A_FAILED(status)) {
+                break;
+            }
+            spin_lock_irqsave(&pDev->pRecvTask->rx_completion_lock, flags);
+            HTC_PACKET_ENQUEUE(&pDev->pRecvTask->rxComQueue, pPacket);
+            spin_unlock_irqrestore(&pDev->pRecvTask->rx_completion_lock, flags);
+        }
+#endif
+#if HIF_DBG
+        printk("up task\n");
+#endif
         up(&pDev->pRecvTask->sem_rx_completion);
 #else
         /* unload sync completion queue */
@@ -1392,10 +1757,13 @@ A_STATUS HIFDevRecvMessagePendingHandler(HIF_SDIO_DEVICE *pDev,
                 break;
 
             NumLookAheads = 0;
-            status = HIFDevProcessRecvHeader(pDev, pPacket, lookAheads,
-                                             &NumLookAheads, TRUE, lookAhead_part2);
+            status = HIFDevProcessRecvHeader(pDev, pPacket, lookAheads, &NumLookAheads, TRUE
+#if HIF_BUNDLE_DIFF_BLK_FRAMES
+                    , lookAhead_part2);
+#else
+                    );
+#endif
             if (A_FAILED(status)) {
-                HTC_PACKET_ENQUEUE_TO_HEAD(&syncCompletedPktsQueue, pPacket);
                 break;
             }
 
@@ -1411,17 +1779,11 @@ A_STATUS HIFDevRecvMessagePendingHandler(HIF_SDIO_DEVICE *pDev,
             }
         }
 #endif
+#if HIF_COSTTIME
+        do_gettimeofday(&tv);
+        gt5 = tv.tv_sec*1000000 + tv.tv_usec;
+#endif
         if (A_FAILED(status)) {
-            while (!HTC_QUEUE_EMPTY(&syncCompletedPktsQueue)) {
-                adf_nbuf_t netbuf;
-
-                pPacket = HTC_PACKET_DEQUEUE(&syncCompletedPktsQueue);
-                if (pPacket == NULL)
-                    break;
-                netbuf = (adf_nbuf_t) pPacket->pNetBufContext;
-                if (netbuf)
-                    adf_nbuf_free(netbuf);
-            }
             break;
         }
 
@@ -1598,11 +1960,15 @@ static A_STATUS HIFDevProcessPendingIRQs(HIF_SDIO_DEVICE *pDev, A_BOOL *pDone,
     A_STATUS status = A_OK;
     A_UINT8 host_int_status = 0;
     A_UINT32 lookAhead[MAILBOX_USED_COUNT];
+#if HIF_BUNDLE_DIFF_BLK_FRAMES
     A_UINT32 lookAhead_part2[MAILBOX_USED_COUNT];
+#endif
     int i;
+#if HIF_COSTTIME
+    struct timeval tv;
+#endif
 
     A_MEMZERO(&lookAhead, sizeof(lookAhead));
-    A_MEMZERO(&lookAhead_part2, sizeof(lookAhead_part2));
     AR_DEBUG_PRINTF(ATH_DEBUG_IRQ,
             ("+ProcessPendingIRQs: (dev: 0x%lX)\n", (unsigned long)pDev));
 
@@ -1639,6 +2005,10 @@ static A_STATUS HIFDevProcessPendingIRQs(HIF_SDIO_DEVICE *pDev, A_BOOL *pDone,
         if (A_FAILED(status)) {
             break;
         }
+#if HIF_COSTTIME
+        do_gettimeofday(&tv);
+        gt7 = tv.tv_sec*1000000 + tv.tv_usec;
+#endif
 
         if (AR_DEBUG_LVL_CHECK(ATH_DEBUG_IRQ)) {
             HIFDevDumpRegisters(pDev,
@@ -1662,15 +2032,20 @@ static A_STATUS HIFDevProcessPendingIRQs(HIF_SDIO_DEVICE *pDev, A_BOOL *pDone,
                 if (pDev->IrqProcRegisters.rx_lookahead_valid & (1 << i)) {
                     /* mailbox has a message and the look ahead is valid */
                     lookAhead[i] = pDev->IrqProcRegisters.rx_lookahead[MAILBOX_LOOKAHEAD_SIZE_IN_WORD*i];
+#if HIF_BUNDLE_DIFF_BLK_FRAMES
                     lookAhead_part2[i] = pDev->IrqProcRegisters.rx_lookahead[MAILBOX_LOOKAHEAD_SIZE_IN_WORD*i + 1];
+#endif
                 }
             }
         } /*end of for loop*/
-#ifdef HIF_RX_THREAD
-        if (((HTC_FRAME_HDR *) &lookAhead[0])->EndpointID >= ENDPOINT_MAX) {
-            AR_DEBUG_PRINTF(ATH_DEBUG_ERROR, ("Endpoint id in register invalid"
-                            " %d\n", ((HTC_FRAME_HDR *) &lookAhead[0])->EndpointID));
-        }
+#if HIF_DBG
+        if(printcnd == 0)
+            printk("lookahead: 0x%08X 0x%08X\n", pDev->IrqProcRegisters.rx_lookahead[0], pDev->IrqProcRegisters.rx_lookahead[1]);
+#endif
+#if HIF_DBG
+        printk("lookahead: 0x%08X\n", lookAhead[0]);
+        if(((HTC_FRAME_HDR *) &lookAhead[0])->EndpointID >= ENDPOINT_MAX )
+            printk("endpoint id in register invalid %d\n", ((HTC_FRAME_HDR *) &lookAhead[0])->EndpointID);
 #endif
     } while (FALSE);
 
@@ -1712,8 +2087,12 @@ static A_STATUS HIFDevProcessPendingIRQs(HIF_SDIO_DEVICE *pDev, A_BOOL *pDone,
                         &lookAhead[i],
                         1,
                         pASyncProcessing,
-                        &fetched,
-                        lookAhead_part2);
+                        &fetched
+#if HIF_BUNDLE_DIFF_BLK_FRAMES
+                        , lookAhead_part2);
+#else
+                        );
+#endif
                 if (A_FAILED(status)) {
                     break;
                 }
@@ -1760,7 +2139,7 @@ static A_STATUS HIFDevProcessPendingIRQs(HIF_SDIO_DEVICE *pDev, A_BOOL *pDone,
     /* an optimization to bypass reading the IRQ status registers unecessarily which can re-wake
      * the target, if upper layers determine that we are in a low-throughput mode, we can
      * rely on taking another interrupt rather than re-checking the status registers which can
-     * re-wake the target.
+     * re-wake the target.HIFDevProcessRecvHeader,
      *
      * NOTE : for host interfaces that use the special GetPendingEventsFunc, this optimization cannot
      * be used due to possible side-effects.  For example, SPI requires the host to drain all
@@ -1779,7 +2158,6 @@ static A_STATUS HIFDevProcessPendingIRQs(HIF_SDIO_DEVICE *pDev, A_BOOL *pDone,
 
 #define DEV_CHECK_RECV_YIELD(pDev) \
             ((pDev)->CurrentDSRRecvCount >= (pDev)->HifIRQYieldParams.RecvPacketYieldCount)
-
 /* Synchronousinterrupt handler, this handler kicks off all interrupt processing.*/
 A_STATUS HIFDevDsrHandler(void *context)
 {
@@ -1787,6 +2165,9 @@ A_STATUS HIFDevDsrHandler(void *context)
     A_STATUS status = A_OK;
     A_BOOL done = FALSE;
     A_BOOL asyncProc = FALSE;
+#if HIF_COSTTIME
+    struct timeval tv;
+#endif
 
     AR_DEBUG_PRINTF(ATH_DEBUG_IRQ,
             ("+DevDsrHandler: (dev: 0x%lX)\n", (unsigned long)pDev));
@@ -1797,6 +2178,14 @@ A_STATUS HIFDevDsrHandler(void *context)
     pDev->RecheckIRQStatusCnt = 0;
 
     while (!done) {
+#if (HIF_DBG) || (HIF_COSTTIME)
+        printk("dsr asyncQ %d\n", HTC_PACKET_QUEUE_DEPTH(&pDev->pRecvTask->rxAllocQueue));
+#endif
+#if HIF_COSTTIME
+        gBundleCnt = 0;
+        do_gettimeofday(&tv);
+        gt0 = tv.tv_sec*1000000 + tv.tv_usec;
+#endif
         status = HIFDevProcessPendingIRQs(pDev, &done, &asyncProc);
         if (A_FAILED(status)) {
             break;

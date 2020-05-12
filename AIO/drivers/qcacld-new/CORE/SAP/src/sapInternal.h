@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012-2017, 2019 The Linux Foundation. All rights reserved.
+ * Copyright (c) 2012-2017 The Linux Foundation. All rights reserved.
  *
  * Previously licensed under the ISC license by Qualcomm Atheros, Inc.
  *
@@ -181,9 +181,6 @@ typedef struct sSapContext {
     v_U32_t             channel;
     v_U32_t             secondary_ch;
 
-    // Include the candidate channel of AP
-    v_U32_t             candidate_ch;
-
     // Include the SME(CSR) sessionId here
     v_U8_t              sessionId;
 
@@ -253,10 +250,6 @@ typedef struct sSapContext {
     tSapChannelListInfo SapChnlList;
     uint16_t           vht_channel_width;
     uint16_t           ch_width_orig;
-#ifdef FEATURE_WLAN_MCC_TO_SCC_SWITCH
-    uint16_t           ch_width_24g_orig;
-    uint16_t           ch_width_5g_orig;
-#endif
 
     // session to scan
     tANI_BOOLEAN        isScanSessionOpen;
@@ -281,8 +274,6 @@ typedef struct sSapContext {
     struct sap_acs_cfg *acs_cfg;
 #ifdef FEATURE_WLAN_MCC_TO_SCC_SWITCH
     v_U8_t             cc_switch_mode;
-    bool               band_switch_enable;
-    bool               ap_p2pclient_concur_enable;
 #endif
 
 #if defined(FEATURE_WLAN_STA_AP_MODE_DFS_DISABLE)
@@ -316,7 +307,6 @@ typedef struct sSapContext {
     eCsrBand	target_band;
     uint8_t     sub20_channelwidth;
     uint32_t    backup_channel;
-    vos_list_t  owe_pending_assoc_ind_list;
 } *ptSapContext;
 
 

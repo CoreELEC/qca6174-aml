@@ -142,7 +142,7 @@ struct wlan_logging {
 	/* Number of buffers to be used for logging */
 	int num_buf;
 	/* Lock to synchronize access to shared logging resource */
-	adf_os_spinlock_t spin_lock;
+	spinlock_t spin_lock;
 	/* Holds the free node which can be used for filling logs */
 	struct list_head free_list;
 	/* Holds the filled nodes which needs to be indicated to APP */
@@ -170,7 +170,7 @@ struct wlan_logging {
 	struct list_head pkt_stat_filled_list;
 	struct pkt_stats_msg *pkt_stats_pcur_node;
 	unsigned int pkt_stat_drop_cnt;
-	adf_os_spinlock_t pkt_stats_lock;
+	spinlock_t pkt_stats_lock;
 	unsigned int pkt_stats_msg_idx;
 };
 
@@ -282,6 +282,7 @@ int wlan_log_to_user(VOS_TRACE_LEVEL log_level, char *to_be_sent, int length)
 	int total_log_len;
 	unsigned int *pfilled_length;
 	bool wake_up_thread = false;
+	unsigned long flags;
 	struct timeval tv;
 	struct rtc_time tm;
 	unsigned long local_time;
@@ -322,10 +323,10 @@ int wlan_log_to_user(VOS_TRACE_LEVEL log_level, char *to_be_sent, int length)
 		/* 1+1 indicate '\n'+'\0' */
 		total_log_len = length + tlen + 1 + 1;
 
-		adf_os_spin_lock_irqsave(&gwlan_logging.spin_lock);
+		spin_lock_irqsave(&gwlan_logging.spin_lock, flags);
 		// wlan logging svc resources are not yet initialized
 		if (!gwlan_logging.pcur_node) {
-			adf_os_spin_unlock_irqrestore(&gwlan_logging.spin_lock);
+			spin_unlock_irqrestore(&gwlan_logging.spin_lock, flags);
 			return -EIO;
 		}
 
@@ -366,7 +367,7 @@ int wlan_log_to_user(VOS_TRACE_LEVEL log_level, char *to_be_sent, int length)
 		ptr[*pfilled_length] = '\n';
 		*pfilled_length += 1;
 
-		adf_os_spin_unlock_irqrestore(&gwlan_logging.spin_lock);
+		spin_unlock_irqrestore(&gwlan_logging.spin_lock, flags);
 
 		/* Wakeup logger thread */
 		if ((true == wake_up_thread)) {
@@ -502,6 +503,7 @@ int pktlog_send_per_pkt_stats_to_user(void)
 {
 	int ret = -1;
 	struct pkt_stats_msg *pstats_msg;
+	unsigned long flags;
 	struct sk_buff *skb_new = NULL;
 	static int rate_limit;
 	bool free_old_skb = false;
@@ -520,12 +522,12 @@ int pktlog_send_per_pkt_stats_to_user(void)
 			break;
 		}
 
-		adf_os_spin_lock_irqsave(&gwlan_logging.pkt_stats_lock);
+		spin_lock_irqsave(&gwlan_logging.pkt_stats_lock, flags);
 
 		pstats_msg = (struct pkt_stats_msg *)
 			(gwlan_logging.pkt_stat_filled_list.next);
 		list_del_init(gwlan_logging.pkt_stat_filled_list.next);
-		adf_os_spin_unlock_irqrestore(&gwlan_logging.pkt_stats_lock);
+		spin_unlock_irqrestore(&gwlan_logging.pkt_stats_lock, flags);
 
 		ret = pkt_stats_fill_headers(pstats_msg->skb);
 		if (ret < 0) {
@@ -550,11 +552,11 @@ err:
 	if (free_old_skb)
 		dev_kfree_skb(pstats_msg->skb);
 
-		adf_os_spin_lock_irqsave(&gwlan_logging.pkt_stats_lock);
+		spin_lock_irqsave(&gwlan_logging.pkt_stats_lock, flags);
 		pstats_msg->skb = skb_new;
 		list_add_tail(&pstats_msg->node,
 				&gwlan_logging.pkt_stat_free_list);
-		adf_os_spin_unlock_irqrestore(&gwlan_logging.pkt_stats_lock);
+		spin_unlock_irqrestore(&gwlan_logging.pkt_stats_lock, flags);
 		ret = 0;
 	}
 
@@ -572,6 +574,7 @@ static int send_filled_buffers_to_user(void)
 	struct sk_buff *skb = NULL;
 	struct nlmsghdr *nlh;
 	static int nlmsg_seq;
+	unsigned long flags;
 	static int rate_limit;
 
 	while (!list_empty(&gwlan_logging.filled_list)
@@ -590,12 +593,12 @@ static int send_filled_buffers_to_user(void)
 		}
 		rate_limit = 0;
 
-		adf_os_spin_lock_irqsave(&gwlan_logging.spin_lock);
+		spin_lock_irqsave(&gwlan_logging.spin_lock, flags);
 
 		plog_msg = (struct log_msg *)
 			(gwlan_logging.filled_list.next);
 		list_del_init(gwlan_logging.filled_list.next);
-		adf_os_spin_unlock_irqrestore(&gwlan_logging.spin_lock);
+		spin_unlock_irqrestore(&gwlan_logging.spin_lock, flags);
 		/* 4 extra bytes for the radio idx */
 		payload_len = plog_msg->filled_length +
 			sizeof(wnl->radio) + sizeof(tAniHdr);
@@ -605,10 +608,11 @@ static int send_filled_buffers_to_user(void)
 				ANI_NL_MSG_LOG, payload_len,
 				NLM_F_REQUEST);
 		if (NULL == nlh) {
-			adf_os_spin_lock_irqsave(&gwlan_logging.spin_lock);
+			spin_lock_irqsave(&gwlan_logging.spin_lock, flags);
 			list_add_tail(&plog_msg->node,
 				&gwlan_logging.free_list);
-			adf_os_spin_unlock_irqrestore(&gwlan_logging.spin_lock);
+			spin_unlock_irqrestore(&gwlan_logging.spin_lock,
+							flags);
 			pr_err("%s: drop_count = %u\n", __func__,
 				++gwlan_logging.drop_count);
 			pr_err("%s: nlmsg_put() failed for msg size[%d]\n",
@@ -625,10 +629,10 @@ static int send_filled_buffers_to_user(void)
 				plog_msg->filled_length +
 				sizeof(tAniHdr));
 
-		adf_os_spin_lock_irqsave(&gwlan_logging.spin_lock);
+		spin_lock_irqsave(&gwlan_logging.spin_lock, flags);
 		list_add_tail(&plog_msg->node,
 				&gwlan_logging.free_list);
-		adf_os_spin_unlock_irqrestore(&gwlan_logging.spin_lock);
+		spin_unlock_irqrestore(&gwlan_logging.spin_lock, flags);
 
 		ret = nl_srv_bcast_host_logs(skb);
 		/* print every 64th drop count */
@@ -705,6 +709,7 @@ static int wlan_logging_thread(void *Arg)
 {
 	int ret_wait_status = 0;
 	int ret = 0;
+	unsigned long flags;
 
 	set_user_nice(current, -2);
 
@@ -766,9 +771,11 @@ static int wlan_logging_thread(void *Arg)
 			} else {
 				gwlan_logging.is_flush_complete = true;
 				/* Flush all current host logs*/
-				adf_os_spin_lock_irqsave(&gwlan_logging.spin_lock);
+				spin_lock_irqsave(&gwlan_logging.spin_lock,
+						  flags);
 				wlan_queue_logmsg_for_app();
-				adf_os_spin_unlock_irqrestore(&gwlan_logging.spin_lock);
+				spin_unlock_irqrestore(&gwlan_logging.spin_lock,
+						       flags);
 				set_bit(HOST_LOG_DRIVER_MSG,
 						&gwlan_logging.eventFlag);
 				set_bit(HOST_LOG_PER_PKT_STATS,
@@ -791,6 +798,7 @@ static int wlan_logging_thread(void *Arg)
 int wlan_logging_sock_activate_svc(int log_fe_to_console, int num_buf)
 {
 	int i, j, pkt_stats_size;
+	unsigned long irq_flag;
 
 	gplog_msg = (struct log_msg *) vmalloc(
 			num_buf * sizeof(struct log_msg));
@@ -804,7 +812,7 @@ int wlan_logging_sock_activate_svc(int log_fe_to_console, int num_buf)
 	gwlan_logging.log_fe_to_console = !!log_fe_to_console;
 	gwlan_logging.num_buf = num_buf;
 
-	adf_os_spin_lock_irqsave(&gwlan_logging.spin_lock);
+	spin_lock_irqsave(&gwlan_logging.spin_lock, irq_flag);
 	INIT_LIST_HEAD(&gwlan_logging.free_list);
 	INIT_LIST_HEAD(&gwlan_logging.filled_list);
 
@@ -815,7 +823,7 @@ int wlan_logging_sock_activate_svc(int log_fe_to_console, int num_buf)
 	gwlan_logging.pcur_node = (struct log_msg *)
 		(gwlan_logging.free_list.next);
 	list_del_init(gwlan_logging.free_list.next);
-	adf_os_spin_unlock_irqrestore(&gwlan_logging.spin_lock);
+	spin_unlock_irqrestore(&gwlan_logging.spin_lock, irq_flag);
 
 	/* Initialize the pktStats data structure here */
 	pkt_stats_size = sizeof(struct pkt_stats_msg);
@@ -828,11 +836,11 @@ int wlan_logging_sock_activate_svc(int log_fe_to_console, int num_buf)
 	vos_mem_zero(gpkt_stats_buffers,
 			MAX_PKTSTATS_BUFF * pkt_stats_size);
 
-	adf_os_spin_lock_irqsave(&gwlan_logging.pkt_stats_lock);
+	spin_lock_irqsave(&gwlan_logging.pkt_stats_lock, irq_flag);
 	gwlan_logging.pkt_stats_msg_idx = 0;
 	INIT_LIST_HEAD(&gwlan_logging.pkt_stat_free_list);
 	INIT_LIST_HEAD(&gwlan_logging.pkt_stat_filled_list);
-	adf_os_spin_unlock_irqrestore(&gwlan_logging.pkt_stats_lock);
+	spin_unlock_irqrestore(&gwlan_logging.pkt_stats_lock, irq_flag);
 
 
 	for (i = 0; i < MAX_PKTSTATS_BUFF; i++) {
@@ -845,16 +853,16 @@ int wlan_logging_sock_activate_svc(int log_fe_to_console, int num_buf)
 			}
 			goto err2;
 		}
-		adf_os_spin_lock_irqsave(&gwlan_logging.pkt_stats_lock);
+		spin_lock_irqsave(&gwlan_logging.pkt_stats_lock, irq_flag);
 		list_add(&gpkt_stats_buffers[i].node,
 			&gwlan_logging.pkt_stat_free_list);
-		adf_os_spin_unlock_irqrestore(&gwlan_logging.pkt_stats_lock);
+		spin_unlock_irqrestore(&gwlan_logging.pkt_stats_lock, irq_flag);
 	}
-	adf_os_spin_lock_irqsave(&gwlan_logging.pkt_stats_lock);
+	spin_lock_irqsave(&gwlan_logging.pkt_stats_lock, irq_flag);
 	gwlan_logging.pkt_stats_pcur_node = (struct pkt_stats_msg *)
 		(gwlan_logging.pkt_stat_free_list.next);
 	list_del_init(gwlan_logging.pkt_stat_free_list.next);
-	adf_os_spin_unlock_irqrestore(&gwlan_logging.pkt_stats_lock);
+	spin_unlock_irqrestore(&gwlan_logging.pkt_stats_lock, irq_flag);
 	/* Pkt Stats intialization done */
 
 	init_waitqueue_head(&gwlan_logging.wait_queue);
@@ -882,15 +890,15 @@ err3:
 			dev_kfree_skb(gpkt_stats_buffers[i].skb);
 	}
 err2:
-	adf_os_spin_lock_irqsave(&gwlan_logging.pkt_stats_lock);
+	spin_lock_irqsave(&gwlan_logging.pkt_stats_lock, irq_flag);
 	gwlan_logging.pkt_stats_pcur_node = NULL;
-	adf_os_spin_unlock_irqrestore(&gwlan_logging.pkt_stats_lock);
+	spin_unlock_irqrestore(&gwlan_logging.pkt_stats_lock, irq_flag);
 	vfree(gpkt_stats_buffers);
 	gpkt_stats_buffers = NULL;
 err1:
-	adf_os_spin_lock_irqsave(&gwlan_logging.spin_lock);
+	spin_lock_irqsave(&gwlan_logging.spin_lock, irq_flag);
 	gwlan_logging.pcur_node = NULL;
-	adf_os_spin_unlock_irqrestore(&gwlan_logging.spin_lock);
+	spin_unlock_irqrestore(&gwlan_logging.spin_lock, irq_flag);
 	vfree(gplog_msg);
 	gplog_msg = NULL;
 	return -ENOMEM;
@@ -898,6 +906,7 @@ err1:
 
 int wlan_logging_sock_deactivate_svc(void)
 {
+	unsigned long irq_flag;
 	int i = 0;
 	if (!gplog_msg)
 		return 0;
@@ -915,13 +924,13 @@ int wlan_logging_sock_deactivate_svc(void)
 	wake_up_interruptible(&gwlan_logging.wait_queue);
 	wait_for_completion(&gwlan_logging.shutdown_comp);
 
-	adf_os_spin_lock_irqsave(&gwlan_logging.spin_lock);
+	spin_lock_irqsave(&gwlan_logging.spin_lock, irq_flag);
 	gwlan_logging.pcur_node = NULL;
-	adf_os_spin_unlock_irqrestore(&gwlan_logging.spin_lock);
+	spin_unlock_irqrestore(&gwlan_logging.spin_lock, irq_flag);
 	vfree(gplog_msg);
 	gplog_msg = NULL;
 
-	adf_os_spin_lock_irqsave(&gwlan_logging.pkt_stats_lock);
+	spin_lock_irqsave(&gwlan_logging.pkt_stats_lock, irq_flag);
 	gwlan_logging.pkt_stats_pcur_node = NULL;
 	gwlan_logging.pkt_stats_msg_idx = 0;
 	gwlan_logging.pkt_stat_drop_cnt = 0;
@@ -929,7 +938,7 @@ int wlan_logging_sock_deactivate_svc(void)
 		if (gpkt_stats_buffers[i].skb)
 			dev_kfree_skb(gpkt_stats_buffers[i].skb);
 	}
-	adf_os_spin_unlock_irqrestore(&gwlan_logging.pkt_stats_lock);
+	spin_unlock_irqrestore(&gwlan_logging.pkt_stats_lock, irq_flag);
 
 	vfree(gpkt_stats_buffers);
 	gpkt_stats_buffers = NULL;
@@ -939,8 +948,8 @@ int wlan_logging_sock_deactivate_svc(void)
 
 int wlan_logging_sock_init_svc(void)
 {
-	adf_os_spinlock_init(&gwlan_logging.spin_lock);
-	adf_os_spinlock_init(&gwlan_logging.pkt_stats_lock);
+	spin_lock_init(&gwlan_logging.spin_lock);
+	spin_lock_init(&gwlan_logging.pkt_stats_lock);
 	gwlan_logging.pcur_node = NULL;
 	gwlan_logging.pkt_stats_pcur_node = NULL;
 	return 0;
@@ -1065,6 +1074,7 @@ void wlan_pkt_stats_to_logger_thread(void *pl_hdr, void *pkt_dump, void *data)
 	struct packet_dump *pkt_stats_dump;
 	int total_stats_len = 0;
 	bool wake_up_thread = false;
+	unsigned long flags;
 	struct sk_buff *ptr;
 	int hdr_size;
 
@@ -1079,10 +1089,10 @@ void wlan_pkt_stats_to_logger_thread(void *pl_hdr, void *pkt_dump, void *data)
 	total_stats_len = sizeof(struct ath_pktlog_hdr) +
 					pktlog_hdr->size;
 
-	adf_os_spin_lock_irqsave(&gwlan_logging.pkt_stats_lock);
+	spin_lock_irqsave(&gwlan_logging.pkt_stats_lock, flags);
 
 	if (!gwlan_logging.pkt_stats_pcur_node) {
-		adf_os_spin_unlock_irqrestore(&gwlan_logging.pkt_stats_lock);
+		spin_unlock_irqrestore(&gwlan_logging.pkt_stats_lock, flags);
 		return;
 	}
 
@@ -1120,7 +1130,7 @@ void wlan_pkt_stats_to_logger_thread(void *pl_hdr, void *pkt_dump, void *data)
 		wlan_get_pkt_stats_free_node();
 	}
 
-	adf_os_spin_unlock_irqrestore(&gwlan_logging.pkt_stats_lock);
+	spin_unlock_irqrestore(&gwlan_logging.pkt_stats_lock, flags);
 
 	/* Wakeup logger thread */
 	if (true == wake_up_thread) {
@@ -1374,12 +1384,14 @@ void wlan_register_txrx_packetdump(void)
  */
 void wlan_flush_host_logs_for_fatal(void)
 {
+	unsigned long flags;
+
 	if (vos_is_log_report_in_progress()) {
 		pr_info("%s:flush all host logs Setting HOST_LOG_POST_MASK\n",
 			 __func__);
-		adf_os_spin_lock_irqsave(&gwlan_logging.spin_lock);
+		spin_lock_irqsave(&gwlan_logging.spin_lock, flags);
 		wlan_queue_logmsg_for_app();
-		adf_os_spin_unlock_irqrestore(&gwlan_logging.spin_lock);
+		spin_unlock_irqrestore(&gwlan_logging.spin_lock, flags);
 		set_bit(HOST_LOG_DRIVER_MSG, &gwlan_logging.eventFlag);
 		wake_up_interruptible(&gwlan_logging.wait_queue);
 	}
