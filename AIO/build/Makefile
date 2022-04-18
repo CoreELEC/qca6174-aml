@@ -37,10 +37,6 @@ endif
 
 CROSS_COMPILE ?= $(subst -ld,-,$(shell cat $(KERNELPATH)/.vmlinux.cmd | awk '{print $$5}'))
 
-ifneq ($(CROSS_COMPILE)gcc, $(wildcard $(CROSS_COMPILE)gcc))
-$(error Please set environment variable CROSS_COMPILE, e.g export CROSS_COMPILE=$(CROSS_COMPILE) or make CROSS_COMPILE=$(CROSS_COMPILE))
-endif
-
 ARCH ?= $(shell ls $(KERNELPATH)/arch)
 
 export KERNELPATH
